@@ -16,15 +16,27 @@ from datetime import datetime, timezone
 def _parse_time(value):
     """Return an aware datetime for an ISO-8601 value, or None."""
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value
-    if not isinstance(value, str) or not value:
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _policy_threshold(policy):
+    """Return the threshold declared by the verification policy."""
+    if not isinstance(policy, dict):
+        return 0
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+        return int(policy.get("threshold") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def parse_bundle(text):
@@ -42,15 +54,22 @@ def parse_bundle(text):
         signatures.append(dict(item))
     bundle = dict(data)
     bundle["digest"] = data.get("digest") or ""
-    bundle["threshold"] = int(data.get("threshold") or 0)
+    try:
+        bundle["threshold"] = int(data.get("threshold") or 0)
+    except (TypeError, ValueError):
+        bundle["threshold"] = 0
     bundle["signatures"] = signatures
     return bundle
 
 
 def verify_one(signature, digest, keyring):
-    """Check one signature value against the key registered for its signer."""
+    """Check one signature against the digest, its signer's key and the keyring."""
+    if not isinstance(signature, dict) or not isinstance(digest, str) or not digest:
+        return False
+    if signature.get("digest") != digest:
+        return False
     signer = signature.get("signer")
-    if not isinstance(signer, str) or signer not in keyring:
+    if not isinstance(signer, str) or signer not in (keyring or {}):
         return False
     expected = keyring[signer]
     if not isinstance(expected, str):
@@ -58,8 +77,10 @@ def verify_one(signature, digest, keyring):
     return signature.get("value") == expected
 
 
-def check_validity(signature, now, policy):
+def check_validity(signature, now, policy=None):
     """Check that the signature validity window contains now (inclusive)."""
+    if not isinstance(signature, dict):
+        return False
     start = _parse_time(signature.get("start"))
     end = _parse_time(signature.get("end"))
     moment = _parse_time(now)
@@ -67,49 +88,68 @@ def check_validity(signature, now, policy):
         return False
     if end < start:
         return False
-    return start <= moment
+    return start <= moment <= end
 
 
 def check_authorized(signer, allowlist):
     """Check that signer appears in the authorization list."""
-    if not isinstance(signer, str):
+    if not isinstance(signer, str) or not signer:
         return False
-    return signer in (allowlist or [])
+    if not isinstance(allowlist, (list, tuple, set, frozenset)):
+        return False
+    return signer in allowlist
 
 
 def count_unique(signatures):
     """Count distinct signers among signatures."""
     signers = set()
     for signature in signatures:
+        if not isinstance(signature, dict):
+            continue
         signer = signature.get("signer")
-        if isinstance(signer, str):
+        if isinstance(signer, str) and signer:
             signers.add(signer)
     return len(signers)
 
 
-def verify_bundle(bundle, keyring, policy, now):
-    """Verify a parsed bundle against a keyring and a threshold policy."""
-    signatures = bundle.get("signatures") or []
-    threshold = int(bundle.get("threshold") or 0)
+def _accepted_signers(bundle, keyring, policy, now):
+    """Return the sorted set of signers with a fully valid signature."""
     digest = bundle.get("digest") or ""
-    if not signatures:
-        return {
-            "ok": True,
-            "count": 0,
-            "threshold": threshold,
-            "signers": [],
-        }
-    accepted = []
-    for signature in signatures:
-        if len(signature.get("digest") or "") != len(digest):
+    allowlist = policy.get("allowlist") if isinstance(policy, dict) else None
+    accepted = set()
+    for signature in bundle.get("signatures") or []:
+        if not isinstance(signature, dict):
             continue
-        if verify_one(signature, digest, keyring):
-            accepted.append(signature)
+        if not verify_one(signature, digest, keyring):
+            continue
+        if not check_authorized(signature.get("signer"), allowlist):
+            continue
+        if not check_validity(signature, now, policy):
+            continue
+        accepted.add(signature.get("signer"))
+    return sorted(accepted)
+
+
+def verify_bundle(bundle, keyring, policy, now):
+    """Verify a parsed bundle against a keyring and a threshold policy.
+
+    The threshold is taken from the policy only; a threshold declared by the
+    bundle itself is ignored.  Each signer contributes at most once and every
+    counted signature must bind the artifact digest, be authorized and be
+    inside its own validity window at ``now``.
+    """
+    if not isinstance(bundle, dict):
+        bundle = {}
+    if isinstance(policy, dict) and keyring is None:
+        keyring = policy.get("keyring")
+    threshold = _policy_threshold(policy)
+    accepted = _accepted_signers(bundle, keyring or {}, policy or {}, now)
+    ok = threshold >= 1 and len(accepted) >= threshold
     return {
-        "ok": len(accepted) >= threshold,
+        "ok": ok,
         "count": len(accepted),
         "threshold": threshold,
-        "signers": [signature.get("signer") for signature in accepted],
+        "signers": accepted,
     }
 
 
@@ -139,21 +179,27 @@ def validate_bundle(bundle):
             seen.add(signer)
         if not signature.get("digest"):
             issues.append("signature is missing a digest: " + str(signer))
+        elif signature.get("digest") != bundle.get("digest"):
+            issues.append("signature digest does not match artifact: " + str(signer))
         if not signature.get("value"):
             issues.append("signature is missing a value: " + str(signer))
+        start = _parse_time(signature.get("start"))
+        end = _parse_time(signature.get("end"))
+        if start is None or end is None:
+            issues.append("signature has an invalid validity window: " + str(signer))
+        elif end < start:
+            issues.append("signature window ends before it starts: " + str(signer))
     return issues
 
 
 def bundle_batch(bundles, policy, now):
-    """Verify a mapping of artifact name to bundle and return each result."""
-    threshold = int(policy.get("threshold") or 0)
+    """Verify a mapping of artifact name to bundle and return each result.
+
+    Each artifact is judged on its own signatures; counts never accumulate
+    across artifacts in the batch.
+    """
+    keyring = policy.get("keyring") if isinstance(policy, dict) else None
     results = {}
-    running = 0
-    for name, bundle in bundles.items():
-        running += len(bundle.get("signatures") or [])
-        results[name] = {
-            "ok": running >= threshold,
-            "count": running,
-            "threshold": threshold,
-        }
+    for name, bundle in (bundles or {}).items():
+        results[name] = verify_bundle(bundle, keyring, policy, now)
     return results
